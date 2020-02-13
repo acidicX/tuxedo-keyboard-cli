@@ -1,6 +1,7 @@
 #![recursion_limit = "1024"]
 
-extern crate structopt;
+use nix::unistd::*;
+use std::process::Command;
 use structopt::StructOpt;
 
 #[macro_use]
@@ -9,113 +10,100 @@ mod errors {
     // Create the Error, ErrorKind, ResultExt, and Result types
     error_chain! {}
 }
-use errors::*;
 
 error_chain! {
     errors {
         MissingSysFs(t: String) {
-            description("invalid toolchain name")
-            display("invalid toolchain name: '{}'", t)
+            description("sysfs missing or ls failed")
+            display("sysfs missing or ls failed")
+        }
+        MissingKernelModule(t: String) {
+            description("kernel module not loaded or lsmod failed")
+            display("kernel module not loaded or lsmod failed")
+        }
+        WrongCliParamRange(t: String) {
+            description("a cli param has been specified with the wrong range")
+            display("the cli param has been specified with the wrong range - outside '{}'", t)
+        }
+        ShellExecFailed(t: String) {
+            description("shell exec has failed")
+            display("shell exec has failed with the following paramter: '{}'", t)
         }
     }
 }
 
-use std::process::Command;
+fn validate_mode(mode: &str) -> Result<u8> {
+    let int_mode = mode.parse::<u8>().unwrap();
+    if int_mode > 7 {
+        bail!(ErrorKind::WrongCliParamRange("0 - 7".to_string()));
+    }
 
-extern crate nix;
-use nix::unistd::*;
+    Ok(int_mode)
+}
 
 #[derive(StructOpt, Debug)]
-#[structopt(name = "tuxedo-keyboard-cli", about = "A CLI for interfacing with the tuxedo keyboard DKMS module")]
+#[structopt(
+    name = "tuxedo-keyboard-cli",
+    about = "A CLI for interfacing with the tuxedo keyboard DKMS module"
+)]
 struct Cli {
     /// color as RGB string
     color: String,
 
-    /// brightness (0 - 100)
+    /// brightness (0 - 255)
     #[structopt(long = "brightness", short = "b", default_value = "75")]
     brightness: u8,
 
     /// backlight modes (0 - 7)
-    #[structopt(long = "mode", short = "m", default_value = "0")]
+    #[structopt(long = "mode", short = "m", default_value = "0", parse(try_from_str = validate_mode))]
     mode: u8,
 }
 
 fn preflight_check() -> Result<()> {
     let check_sysfs = Command::new("ls")
         .arg("/sys/devices/platform/tuxedo_keyboard")
-        .output().unwrap_or_else(|e| {
-        panic!("failed to execute process: {}", e);
-    });
+        .output()
+        .unwrap();
 
-    if check_sysfs.status.success() {
-        println!("sysfs exists");
-    } else {
-        let s = String::from_utf8_lossy(&check_sysfs.stderr);
-        //println!("sysfs missing or ls failed and stderr was:\n{}", s);
-        bail!(ErrorKind::MissingSysFs("sysfs missing or ls failed".to_string()));
+    if !check_sysfs.status.success() {
+        bail!(ErrorKind::MissingSysFs("".to_string()));
     }
 
     let check_module = Command::new("sh")
         .arg("-c")
-        .arg("lsmod | grep tuxedo_keybard")
-        .output().unwrap_or_else(|e| {
-        panic!("failed to execute process: {}", e);
-    });
+        .arg("lsmod | grep tuxedo_keyboard")
+        .output()
+        .unwrap();
 
-    if check_module.status.success() {
-        println!("kernel module is loaded");
-    } else {
-        let s = String::from_utf8_lossy(&check_module.stderr);
-        //println!("kernel module not loaded or lsmod failed and stderr was:\n{}", s);
-        bail!(ErrorKind::MissingSysFs("kernel module not loaded or lsmod failed".to_string()));
+    if !check_module.status.success() {
+        bail!(ErrorKind::MissingKernelModule("".to_string()));
     }
 
     Ok(())
 }
 
-fn cli_sanity_check() {
-    let cli = Cli::from_args();
-    if cli.brightness > 100 {
-        panic!("failed to execute process");
-    }
-    if cli.mode > 7 {
-        panic!("failed to execute process");
-    }
-}
-
-fn exec_sh(echo: String) {
+fn exec_sh(echo: String) -> Result<()> {
     let uid = getuid();
     if uid.is_root() {
-        println!("{}", "rootin tootin");
-        let executed_shell = Command::new("sh")
-            .arg("-c")
-            .arg(&echo)
-            .output().unwrap_or_else(|e| {
-            panic!("failed to execute process: {}", e);
-        });
+        let executed_shell = Command::new("sh").arg("-c").arg(&echo).output().unwrap();
 
-        if executed_shell.status.success() {
-            println!("{} {}", "shell exec succeeded!", &echo);
-        } else {
-            let s = String::from_utf8_lossy(&executed_shell.stderr);
-            println!("shell exec failed and stderr was:\n{}", s);
+        if !executed_shell.status.success() {
+            bail!(ErrorKind::ShellExecFailed(echo));
         }
     } else {
         let executed_shell = Command::new("sudo")
             .arg("sh")
             .arg("-c")
             .arg(&echo)
-            .output().unwrap_or_else(|e| {
-            panic!("failed to execute process: {}", e);
-        });
+            .output()
+            .unwrap();
 
-        if executed_shell.status.success() {
-            println!("{} {}", "shell exec succeeded!", &echo);
-        } else {
-            let s = String::from_utf8_lossy(&executed_shell.stderr);
-            println!("shell exec failed and stderr was:\n{}", s);
+        if !executed_shell.status.success() {
+            bail!(ErrorKind::ShellExecFailed(echo));
         }
     }
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -132,15 +120,44 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    preflight_check().unwrap_err();
-    cli_sanity_check();
+    preflight_check()?;
     let cli = Cli::from_args();
 
-    let set_brightness_str = format!("{}{}{}", "echo ", cli.brightness, " > /sys/devices/platform/tuxedo_keyboard/brightness");
-    exec_sh(set_brightness_str);
+    let set_brightness_str = format!(
+        "{}{}{}",
+        "echo ", cli.brightness, " > /sys/devices/platform/tuxedo_keyboard/brightness"
+    );
+    exec_sh(set_brightness_str)?;
 
-    let set_mode_str = format!("{}{}{}", "echo ", cli.mode, " > /sys/devices/platform/tuxedo_keyboard/mode");
-    exec_sh(set_mode_str);
+    let set_mode_str = format!(
+        "{}{}{}",
+        "echo ", cli.mode, " > /sys/devices/platform/tuxedo_keyboard/mode"
+    );
+    exec_sh(set_mode_str)?;
+
+    let set_color_left_str = format!(
+        "{}{}{}",
+        "echo 0x", cli.color, " > /sys/devices/platform/tuxedo_keyboard/color_left"
+    );
+    exec_sh(set_color_left_str)?;
+
+    let set_color_center_str = format!(
+        "{}{}{}",
+        "echo 0x", cli.color, " > /sys/devices/platform/tuxedo_keyboard/color_center"
+    );
+    exec_sh(set_color_center_str)?;
+
+    let set_color_right_str = format!(
+        "{}{}{}",
+        "echo 0x", cli.color, " > /sys/devices/platform/tuxedo_keyboard/color_right"
+    );
+    exec_sh(set_color_right_str)?;
+
+    let set_color_extra_str = format!(
+        "{}{}{}",
+        "echo 0x", cli.color, " > /sys/devices/platform/tuxedo_keyboard/color_extra"
+    );
+    exec_sh(set_color_extra_str)?;
 
     Ok(())
 }
